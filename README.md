@@ -68,6 +68,29 @@ python examples/double_integrator_AC_DRL.py \
 
 The `--visualize` flag opens a matplotlib window showing the training environment in real-time. Use `--visualize-env-id` to specify which environment to visualize (default: 0).
 
+### 1d. Evaluate Trained Model
+
+Evaluate a trained checkpoint without training:
+
+```bash
+python examples/double_integrator_AC_DRL.py \
+  --config configs/double_integrator_waypoint_mlp.yaml \
+  --eval-only \
+  --eval-runs 20 \
+  --eval-output-dir eval_outputs/double_integrator \
+  --device cuda
+```
+
+**Evaluation Parameters:**
+- `--eval-only`: Skip training and only run evaluation on available checkpoints
+- `--eval-runs`: Number of evaluation episodes to run (default: 20)
+- `--eval-output-dir`: Directory for evaluation plots and summaries
+- `--eval-max-steps`: Maximum steps per evaluation episode (defaults to episode length)
+- `--eval-seed`: Random seed for evaluation (default: training_seed + 1337)
+- `--resume`: Checkpoint selection strategy - `auto`, `best`, `latest`, or `none` (default: auto)
+
+The evaluation will automatically find the best or latest checkpoint from the checkpoint directory and generate plots showing the agent's performance.
+
 ### 2. Train on SE(2) Kinematic Waypoint Task
 
 ```bash
