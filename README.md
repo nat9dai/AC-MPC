@@ -219,10 +219,6 @@ training:
 - **SE(2) Kinematic Waypoint**: Planar robot with orientation tracking waypoints
 - **SE(2) with Obstacles**: Same as above with obstacles and lidar sensing
 
-## Citation
-
-If you use this code, please cite the original paper:
-- Transformer-based Actor-Critic with Differentiable MPC
 
 ## License
 
