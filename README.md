@@ -52,6 +52,22 @@ python examples/double_integrator_AC_DRL.py \
   --device cuda
 ```
 
+### 1c. Train with Real-time Visualization
+
+Enable real-time visualization during training to see the agent's behavior:
+
+```bash
+python examples/double_integrator_AC_DRL.py \
+  --config configs/double_integrator_waypoint_mlp.yaml \
+  --total-iters 50 \
+  --num-envs 8 \
+  --device cuda \
+  --visualize \
+  --visualize-env-id 0
+```
+
+The `--visualize` flag opens a matplotlib window showing the training environment in real-time. Use `--visualize-env-id` to specify which environment to visualize (default: 0).
+
 ### 2. Train on SE(2) Kinematic Waypoint Task
 
 ```bash
