@@ -451,32 +451,32 @@ def _skew_torch(v: Tensor) -> Tensor:
     ], dim=-2)
 
 
-def _reorthogonalize_torch(R_flat: Tensor) -> Tensor:
-    """Project batched flattened rotation matrices back to SO(3).
+# def _reorthogonalize_torch(R_flat: Tensor) -> Tensor:
+#     """Project batched flattened rotation matrices back to SO(3).
 
-    Uses Gram-Schmidt orthonormalization which is fully differentiable
-    and vmap-compatible (no SVD, avoids NaN gradients from degenerate
-    singular values).
+#     Uses Gram-Schmidt orthonormalization which is fully differentiable
+#     and vmap-compatible (no SVD, avoids NaN gradients from degenerate
+#     singular values).
 
-    Input:  R_flat  [*, 9]
-    Output: R_flat  [*, 9]
-    """
-    shape = R_flat.shape[:-1]
-    R = R_flat.reshape(*shape, 3, 3)
+#     Input:  R_flat  [*, 9]
+#     Output: R_flat  [*, 9]
+#     """
+#     shape = R_flat.shape[:-1]
+#     R = R_flat.reshape(*shape, 3, 3)
 
-    # Gram-Schmidt on columns
-    c0 = R[..., :, 0]  # [*, 3]
-    c1 = R[..., :, 1]
-    # Normalize first column
-    e0 = c0 / (torch.linalg.norm(c0, dim=-1, keepdim=True) + 1e-8)
-    # Orthogonalize second column
-    c1_orth = c1 - (c1 * e0).sum(dim=-1, keepdim=True) * e0
-    e1 = c1_orth / (torch.linalg.norm(c1_orth, dim=-1, keepdim=True) + 1e-8)
-    # Third column via cross product (guarantees right-handedness)
-    e2 = torch.linalg.cross(e0, e1, dim=-1)
+#     # Gram-Schmidt on columns
+#     c0 = R[..., :, 0]  # [*, 3]
+#     c1 = R[..., :, 1]
+#     # Normalize first column
+#     e0 = c0 / (torch.linalg.norm(c0, dim=-1, keepdim=True) + 1e-8)
+#     # Orthogonalize second column
+#     c1_orth = c1 - (c1 * e0).sum(dim=-1, keepdim=True) * e0
+#     e1 = c1_orth / (torch.linalg.norm(c1_orth, dim=-1, keepdim=True) + 1e-8)
+#     # Third column via cross product (guarantees right-handedness)
+#     e2 = torch.linalg.cross(e0, e1, dim=-1)
 
-    R_ortho = torch.stack([e0, e1, e2], dim=-1)  # [*, 3, 3]
-    return R_ortho.reshape(*shape, 9)
+#     R_ortho = torch.stack([e0, e1, e2], dim=-1)  # [*, 3, 3]
+#     return R_ortho.reshape(*shape, 9)
 
 
 def _prepare_inputs_quad(x: Tensor, u: Tensor) -> Tuple[Tensor, Tensor]:
@@ -488,6 +488,24 @@ def _prepare_inputs_quad(x: Tensor, u: Tensor) -> Tuple[Tensor, Tensor]:
     assert x.shape[-1] == 15, f"Expected state dim 15, got {x.shape[-1]}"
     assert u.shape[-1] == 4, f"Expected action dim 4, got {u.shape[-1]}"
     return x, u
+
+
+def _rodrigues_torch(v: Tensor) -> Tensor:
+    """Compute rotation matrix from axis-angle vector via Rodrigues' formula.
+
+    Matches ``rotation_matrix_from_vector`` from rpg_flightning.
+
+    Input:  v  [*, 3]  axis-angle vector (angle = ||v||, axis = v/||v||)
+    Output: R  [*, 3, 3]
+    """
+    K = _skew_torch(v)                                     # [*, 3, 3]
+    theta = torch.linalg.norm(v, dim=-1, keepdim=True).unsqueeze(-1)  # [*, 1, 1]
+    theta = theta + 1e-5  # avoid division by zero
+    I = torch.eye(3, dtype=v.dtype, device=v.device)       # noqa: E741
+    K2 = torch.matmul(K, K)
+    sin_term = torch.sin(theta) / theta
+    cos_term = (1.0 - torch.cos(theta)) / (theta * theta)
+    return I + sin_term * K + cos_term * K2
 
 
 def build_quadrotor_dynamics(
@@ -502,14 +520,127 @@ def build_quadrotor_dynamics(
 ]:
     """Factory returning ``(f_dyn, None)`` for the quadrotor.
 
-    The Jacobian is left to the MPC controller's autodiff fallback
-    because analytical Jacobians of RK4 with rotation dynamics are
-    complex and error-prone.
+    Matches the simplified dynamics from rpg_flightning:
+    - Euler step for position and velocity
+    - Exact rotation step via Rodrigues' formula
 
-    Parameters
-    ----------
-    mass, gravity, max_thrust, max_body_rate : float
-        Physical parameters matching the environment.
+    State  (nx=15): [p(3), v(3), R_flat(9)]
+    Action (nu=4):  [thrust, ωx, ωy, ωz]
+
+    Returns
+    -------
+    f_dyn : callable(x, u, dt) -> x_next
+        Differentiable dynamics (PyTorch).
+    None
+        Placeholder for the Jacobian function (autodiff will be used).
+    """
+    g_vec_vals = [0.0, 0.0, -gravity]
+
+    def f_dyn_torch(x: Tensor, u: Tensor, dt: float) -> Tensor:
+        x, u = _prepare_inputs_quad(x, u)
+        batch = x.shape[0]
+        dtype, device = x.dtype, x.device
+        dt_t = torch.as_tensor(dt, dtype=dtype, device=device)
+        g_vec = torch.tensor(g_vec_vals, dtype=dtype, device=device)
+
+        p = x[..., 0:3]
+        v = x[..., 3:6]
+        R_flat = x[..., 6:15]
+        R = R_flat.reshape(*R_flat.shape[:-1], 3, 3)
+
+        # Clamp controls
+        thrust = torch.clamp(u[..., 0:1], 0.0, max_thrust)   # [B, 1]
+        omega = torch.clamp(u[..., 1:4], -max_body_rate, max_body_rate)  # [B, 3]
+
+        # Acceleration: a = thrust / mass  (scalar, applied along body z)
+        accel_body = torch.zeros_like(v)
+        accel_body[..., 2] = thrust.squeeze(-1) / mass
+        accel_world = g_vec + torch.einsum("...ij,...j->...i", R, accel_body)
+
+        # Euler step for position and velocity
+        p_new = p + dt_t * v
+        v_new = v + dt_t * accel_world
+
+        # Exact rotation step: R_new = R @ rodrigues(dt * omega)
+        R_delta = _rodrigues_torch(dt_t * omega)              # [B, 3, 3]
+        R_new = torch.matmul(R, R_delta)                      # [B, 3, 3]
+
+        x_next = torch.cat([p_new, v_new, R_new.reshape(*R_new.shape[:-2], 9)], dim=-1)
+
+        if batch == 1:
+            return x_next.squeeze(0)
+        return x_next
+
+    return f_dyn_torch, None
+
+# Quaternion-based dynamics (10-D state)
+
+def _quat_rotate_z_torch(q: Tensor, s: Tensor) -> Tensor:
+    """Compute R(q) @ [0, 0, s] without building the full rotation matrix.
+
+    Only the third column of R(q) is needed, scaled by *s*.
+
+    Input:  q [*, 4]  quaternion (scalar-first)
+            s [*, 1]  scalar (thrust / mass)
+    Output: v [*, 3]
+    """
+    q0, qx, qy, qz = q[..., 0:1], q[..., 1:2], q[..., 2:3], q[..., 3:4]
+    # Third column of R(q) = [2(qx*qz + q0*qy), 2(qy*qz - q0*qx), 1 - 2(qx^2 + qy^2)]
+    return torch.cat([
+        2.0 * (qx * qz + q0 * qy) * s,
+        2.0 * (qy * qz - q0 * qx) * s,
+        (1.0 - 2.0 * (qx * qx + qy * qy)) * s,
+    ], dim=-1)
+
+
+def _quat_omega_product_torch(omega: Tensor, q: Tensor) -> Tensor:
+    """Compute q_dot = 0.5 * Omega(omega) @ q as a quaternion product.
+
+    Equivalent to 0.5 * [0, omega] ⊗ q  (Hamilton product), avoiding
+    construction of the 4x4 Omega matrix.
+
+    Input:  omega [*, 3]  body angular velocity
+            q     [*, 4]  quaternion (scalar-first)
+    Output: q_dot [*, 4]
+    """
+    q0 = q[..., 0:1]
+    q_vec = q[..., 1:4]   # [qx, qy, qz]
+    # [0, omega] ⊗ q = [-omega·q_vec, q0*omega + omega×q_vec]
+    scalar = -(omega * q_vec).sum(dim=-1, keepdim=True)
+    vector = q0 * omega + torch.linalg.cross(omega, q_vec, dim=-1)
+    return 0.5 * torch.cat([scalar, vector], dim=-1)
+
+
+def _prepare_inputs_quat(x: Tensor, u: Tensor) -> Tuple[Tensor, Tensor]:
+    """Ensure inputs are batched: [nx] -> [1, nx]."""
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    if u.ndim == 1:
+        u = u.unsqueeze(0)
+    assert x.shape[-1] == 10, f"Expected state dim 10, got {x.shape[-1]}"
+    assert u.shape[-1] == 4, f"Expected action dim 4, got {u.shape[-1]}"
+    return x, u
+
+
+def build_quadrotor_dynamics_quat(
+    *,
+    mass: float = 0.752,
+    gravity: float = 9.81,
+    max_thrust: float = 20.0,
+    max_body_rate: float = 6.0,
+) -> Tuple[
+    Callable[[Tensor, Tensor, float], Tensor],
+    None,
+]:
+    """Factory returning ``(f_dyn, None)`` for quaternion-based quadrotor.
+
+    State  (nx=10): [p(3), v(3), q(4)]  with q = [q0, qx, qy, qz] (scalar-first)
+    Action (nu=4):  [f_r, ωx, ωy, ωz]   collective thrust + body rates
+
+    Dynamics:
+        ṗ = v
+        v̇ = (1/m) R(q) f_r e_z − g e_z
+        q̇ = (1/2) Ω(ω) q
 
     Returns
     -------
@@ -521,10 +652,9 @@ def build_quadrotor_dynamics(
     g_vec_vals = [0.0, 0.0, -gravity]
 
     def _continuous(x: Tensor, u: Tensor, g_vec: Tensor) -> Tensor:
-        """Continuous-time derivative.  x: [B, 15], u: [B, 4] -> dx: [B, 15]."""
+        """Continuous-time derivative.  x: [B, 10], u: [B, 4] -> dx: [B, 10]."""
         v = x[..., 3:6]
-        R_flat = x[..., 6:15]
-        R = R_flat.reshape(*R_flat.shape[:-1], 3, 3)
+        q = x[..., 6:10]
 
         thrust = u[..., 0:1]  # [B, 1]
         omega = u[..., 1:4]   # [B, 3]
@@ -532,19 +662,16 @@ def build_quadrotor_dynamics(
         # ṗ = v
         p_dot = v
 
-        # v̇ = g + R @ [0, 0, thrust/mass]
-        thrust_body = torch.zeros_like(v)
-        thrust_body[..., 2] = thrust.squeeze(-1) / mass
-        v_dot = g_vec + torch.einsum("...ij,...j->...i", R, thrust_body)
+        # v̇ = (1/m) R(q) f_r e_z − g e_z
+        v_dot = g_vec + _quat_rotate_z_torch(q, thrust / mass)
 
-        # Ṙ = R @ skew(ω)
-        skew_omega = _skew_torch(omega)
-        R_dot = torch.matmul(R, skew_omega)  # [B, 3, 3]
+        # q̇ = (1/2) Ω(ω) q  (computed as quaternion product)
+        q_dot = _quat_omega_product_torch(omega, q)
 
-        return torch.cat([p_dot, v_dot, R_dot.reshape(*R_dot.shape[:-2], 9)], dim=-1)
+        return torch.cat([p_dot, v_dot, q_dot], dim=-1)
 
     def f_dyn_torch(x: Tensor, u: Tensor, dt: float) -> Tensor:
-        x, u = _prepare_inputs_quad(x, u)
+        x, u = _prepare_inputs_quat(x, u)
         batch = x.shape[0]
         dtype, device = x.dtype, x.device
         dt_t = torch.as_tensor(dt, dtype=dtype, device=device)
@@ -563,11 +690,10 @@ def build_quadrotor_dynamics(
         k4 = _continuous(x + dt_t * k3, u_clamped, g_vec)
         x_next = x + (dt_t / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
-        # Re-orthogonalize rotation
-        x_next = torch.cat([
-            x_next[..., :6],
-            _reorthogonalize_torch(x_next[..., 6:15]),
-        ], dim=-1)
+        # Normalize quaternion
+        q_next = x_next[..., 6:10]
+        q_next = q_next / (torch.linalg.norm(q_next, dim=-1, keepdim=True) + 1e-8)
+        x_next = torch.cat([x_next[..., :6], q_next], dim=-1)
 
         if batch == 1:
             return x_next.squeeze(0)

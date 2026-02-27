@@ -11,7 +11,7 @@ model:
   waypoint_dim: 3
   include_prev_action: false
   actor:
-    input_dim: 6
+    input_dim: 15
     backbone_type: mlp
     include_prev_action: false
     waypoint_dim: 3
@@ -24,19 +24,19 @@ model:
       dropout: 0.0
     mpc:
       horizon: 20
-      state_dim: 6
-      action_dim: 3
+      state_dim: 15
+      action_dim: 4
       dt: 0.1
       latent_dim: 512
       device: cpu
       max_iter: 15
-      tol_x: 1.0e-3
-      tol_u: 1.0e-3
-      reg_eps: 1.0e-3
-      u_min: [-3.0, -3.0, -3.0]
-      u_max: [3.0, 3.0, 3.0]
-      require_analytic_jacobian: true
-      enable_autodiff_fallback: false
+      tol_x: 1.0e-2
+      tol_u: 1.0e-2
+      reg_eps: 1.0e-2
+      u_min: [0.0, -6.0, -6.0, -6.0]
+      u_max: [20.0, 6.0, 6.0, 6.0]
+      require_analytic_jacobian: false
+      enable_autodiff_fallback: true
       jacobian_cache_size: 256
       jacobian_cache_max_age: 128
       warm_start_cache_max_size: 32
@@ -56,7 +56,7 @@ model:
         linear_state_bound: 10.0
         linear_action_bound: 5.0
   critic:
-    input_dim: 6
+    input_dim: 15
     backbone_type: mlp
     include_prev_action: false
     waypoint_dim: 3
@@ -71,8 +71,8 @@ model:
 
 sampler:
   num_envs: 32
-  rollout_steps: 24
-  episode_len: 24
+  rollout_steps: 6
+  episode_len: 6
 
 training:
   device: cpu

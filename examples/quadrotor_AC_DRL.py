@@ -27,12 +27,12 @@ from ACMPC import (  # noqa: E402
     TrainingLoop,
     load_experiment_config,
 )
-from ACMPC.envs.quadrotor_double_integrator_waypoint import build_velocity_dynamics_3d  # noqa: E402
+from ACMPC.envs.quadrotor_waypoint import build_quadrotor_dynamics  # noqa: E402
 from ACMPC.experiment_config import ExperimentConfig  # noqa: E402
 from ACMPC.sampling import RolloutBatch, RolloutCollector  # noqa: E402
 from ACMPC.training.checkpoint import CheckpointConfig, CheckpointManager  # noqa: E402
 from examples.quadrotor_waypoint_common import (  # noqa: E402
-    QuadrotorVelocityAdapter,
+    QuadrotorStateObservationAdapter,
     build_env_manager,
     prepare_config,
     probe_dimensions,
@@ -80,15 +80,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity", type=float, default=9.81)
     parser.add_argument("--max-thrust", type=float, default=20.0)
     parser.add_argument("--max-body-rate", type=float, default=6.0)
-    # Velocity adapter / low-level controller
-    parser.add_argument("--max-speed", type=float, default=3.0,
-                        help="Max velocity command magnitude (m/s)")
-    parser.add_argument("--velocity-response", type=float, default=0.5,
-                        help="First-order velocity response factor in (0, 1]")
-    parser.add_argument("--kv", type=float, default=5.0,
-                        help="Geometric controller velocity gain")
-    parser.add_argument("--kR", type=float, default=10.0,
-                        help="Geometric controller rotation gain")
     # Task
     parser.add_argument("--waypoint-range", type=float, default=2.0)
     parser.add_argument("--goal-radius", type=float, default=0.3)
@@ -157,10 +148,6 @@ def build_env_kwargs(args: argparse.Namespace, *, episode_len: int) -> Dict:
         "control_gain": float(args.control_gain),
         "max_distance": float(args.max_distance),
         "boundary_penalty": float(args.boundary_penalty),
-        # Velocity adapter / geometric controller
-        "kv": float(args.kv),
-        "kR": float(args.kR),
-        "max_speed": float(args.max_speed),
     }
 
 
@@ -382,7 +369,6 @@ def evaluate_checkpoint(
     checkpoint_path: Path,
     *,
     dynamics_fn,
-    dynamics_jacobian_fn,
     env_kwargs: Dict,
     history_window: int,
     eval_runs: int,
@@ -401,7 +387,7 @@ def evaluate_checkpoint(
     eval_agent = ActorCriticAgent(
         agent_cfg_eval,
         dynamics_fn=dynamics_fn,
-        dynamics_jacobian_fn=dynamics_jacobian_fn,
+        dynamics_jacobian_fn=None,
     )
     payload = torch.load(checkpoint_path, map_location=device)
     if "agent" not in payload:
@@ -416,7 +402,7 @@ def evaluate_checkpoint(
     eval_agent.to(device)
 
     logs: List[EvalEpisodeLog] = []
-    env = QuadrotorVelocityAdapter(**env_kwargs)
+    env = QuadrotorStateObservationAdapter(**env_kwargs)
     try:
         for episode_idx in range(eval_runs):
             episode_seed = seed + episode_idx
@@ -502,9 +488,12 @@ def main() -> None:
         rollout_len=rollout_len,
         mpc_horizon=config.model.actor.mpc.horizon,
         dt=env_kwargs["dt"],
-        mpc_dt=args.control_substeps * env_kwargs["dt"],  # control period = substeps * sim dt
-        max_speed=env_kwargs["max_speed"],
+        mpc_dt=args.control_substeps * env_kwargs["dt"],
+        max_thrust=env_kwargs["max_thrust"],
+        max_body_rate=env_kwargs["max_body_rate"],
         device=device,
+        mass=env_kwargs["mass"],
+        gravity=env_kwargs["gravity"],
     )
 
     # Ensure MLP output_dim matches MPC latent_dim
@@ -514,14 +503,16 @@ def main() -> None:
     agent_cfg.device = device
     agent_cfg_eval_template = copy.deepcopy(agent_cfg)
 
-    dynamics_fn, dynamics_jacobian_fn = build_velocity_dynamics_3d(
-        max_speed=env_kwargs["max_speed"],
-        velocity_response=args.velocity_response,
+    dynamics_fn, _ = build_quadrotor_dynamics(
+        mass=env_kwargs["mass"],
+        gravity=env_kwargs["gravity"],
+        max_thrust=env_kwargs["max_thrust"],
+        max_body_rate=env_kwargs["max_body_rate"],
     )
     agent = ActorCriticAgent(
         agent_cfg,
         dynamics_fn=dynamics_fn,
-        dynamics_jacobian_fn=dynamics_jacobian_fn,
+        dynamics_jacobian_fn=None,
     )
 
     diagnostics = create_diagnostics_options(config)
@@ -538,7 +529,7 @@ def main() -> None:
         f"MPC horizon: {config.model.actor.mpc.horizon} | "
         f"History window: {config.model.history_window} | "
         f"MPC state: {dims.state_dim}D | MPC action: {dims.action_dim}D | "
-        f"Max speed: {env_kwargs['max_speed']} m/s"
+        f"Mass: {env_kwargs['mass']} kg"
     )
     print(f"Checkpoint dir: {checkpoint_dir}")
     print()
@@ -556,13 +547,13 @@ def main() -> None:
                     from utils.training_visualizer import create_training_visualizer
 
                     def make_vis_env(env_id, **kwargs):
-                        return QuadrotorVelocityAdapter(env_id=env_id, **kwargs)
+                        return QuadrotorStateObservationAdapter(env_id=env_id, **kwargs)
 
                     vis_agent_cfg = copy.deepcopy(agent_cfg)
                     vis_agent = ActorCriticAgent(
                         vis_agent_cfg,
                         dynamics_fn=dynamics_fn,
-                        dynamics_jacobian_fn=dynamics_jacobian_fn,
+                        dynamics_jacobian_fn=None,
                     )
                     training_state = agent.state_dict()
                     filtered_state = {
@@ -667,7 +658,6 @@ def main() -> None:
                 agent_cfg_eval_template,
                 checkpoint_path,
                 dynamics_fn=dynamics_fn,
-                dynamics_jacobian_fn=dynamics_jacobian_fn,
                 env_kwargs=env_kwargs,
                 history_window=config.model.history_window,
                 eval_runs=args.eval_runs,
