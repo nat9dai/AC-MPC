@@ -438,7 +438,7 @@ class QuadrotorWaypointEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
-# PyTorch dynamics for MPC  (RK4)
+# PyTorch dynamics for MPC
 # ---------------------------------------------------------------------------
 
 def _skew_torch(v: Tensor) -> Tensor:
