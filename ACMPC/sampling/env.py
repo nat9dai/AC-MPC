@@ -50,10 +50,12 @@ class AbsoluteEnvWrapper:
         dtype: torch.dtype = torch.float32,
         reward_fn: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
         observation_fn: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
+        substeps: int = 1,
     ) -> None:
         self.env = env
         self.device = torch.device(device)
         self.dtype = dtype
+        self.substeps = max(1, int(substeps))
         self.state_fn = state_fn or (lambda obs, info: obs)
         self._default_waypoint_len = waypoint_len
         self.waypoint_fn = waypoint_fn or self._default_waypoint
@@ -101,16 +103,28 @@ class AbsoluteEnvWrapper:
 
     def step(self, action: Tensor):
         action_np = np.asarray(action.detach().cpu().numpy())
-        result = self.env.step(action_np)
 
-        if len(result) == 5:
-            obs, reward, terminated, truncated, info = result
-            done = bool(terminated or truncated)
-        elif len(result) == 4:
-            obs, reward, done, info = result
-            done = bool(done)
-        else:
-            raise ValueError("Environment step output not recognised.")
+        accumulated_reward = 0.0
+        obs = None
+        info: dict = {}
+        done = False
+        terminated = False
+        truncated = False
+
+        for _ in range(self.substeps):
+            result = self.env.step(action_np)
+            if len(result) == 5:
+                obs, reward, terminated, truncated, info = result
+                done = bool(terminated or truncated)
+            elif len(result) == 4:
+                obs, reward, done, info = result
+                terminated = bool(done)
+                truncated = False
+            else:
+                raise ValueError("Environment step output not recognised.")
+            accumulated_reward += float(reward)
+            if done:
+                break
 
         if done:
             # Preserve terminal info separately to avoid double-counting in the new episode.
@@ -129,7 +143,7 @@ class AbsoluteEnvWrapper:
             obs_tensor = obs
             episode_start = False
 
-        return self._build_output(obs_tensor, info, reward, done, episode_start)
+        return self._build_output(obs_tensor, info, accumulated_reward, done, episode_start)
 
     # ------------------------------------------------------------------
     # Helpers

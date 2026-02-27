@@ -83,10 +83,11 @@ def pnqp(
 
     if x_init is None:
         if n == 1:
-            x = -(q / H.squeeze(-1))
+            x = -(q / (H.squeeze(-1) + reg))
         else:
-            lu, piv = torch.linalg.lu_factor(H)
-            x = -torch.linalg.lu_solve(lu, piv, q.unsqueeze(-1)).squeeze(-1)
+            # Use lstsq for robustness against singular H matrices
+            H_reg = H + I_reg
+            x = -torch.linalg.lstsq(H_reg, q.unsqueeze(-1)).solution.squeeze(-1)
     else:
         x = x_init.clone()
     x = eclamp(x, lower, upper)
@@ -104,10 +105,9 @@ def pnqp(
         g_r = g * free
 
         if n == 1:
-            dx = -g_r / H_r.squeeze(-1)
+            dx = -g_r / (H_r.squeeze(-1) + reg)
         else:
-            lu, piv = torch.linalg.lu_factor(H_r)
-            dx = -torch.linalg.lu_solve(lu, piv, g_r.unsqueeze(-1)).squeeze(-1)
+            dx = -torch.linalg.lstsq(H_r, g_r.unsqueeze(-1)).solution.squeeze(-1)
 
         if dx.abs().max() < tol:
             break

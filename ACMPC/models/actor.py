@@ -279,16 +279,19 @@ class TransformerActor(nn.Module):
                         f"raw_waypoint_seq length {geom_waypoint.size(1)} exceeds configured waypoint_sequence_len {self.waypoint_sequence_len}."
                     )
 
-            # RELATIVE COORDINATES TRANSFORMATION (Full SE2 Invariance)
-            # Extract current position (x, y) and orientation (theta) from geometric state.
-            current_pos = geom_state[:, :2]  # [Batch, 2]
+            # RELATIVE COORDINATES TRANSFORMATION
+            # Extract current position from geometric state.  The number of
+            # position components equals the waypoint dimension (2 for planar,
+            # 3 for 3-D tasks like the quadrotor).
+            pos_dim = self.waypoint_dim
+            current_pos = geom_state[:, :pos_dim]  # [Batch, pos_dim]
 
             # Broadcast current_pos to match waypoint sequence length
-            # rel_pos_global: [Batch, W, 2]
+            # rel_pos_global: [Batch, W, pos_dim]
             rel_pos_global = geom_waypoint - current_pos.unsqueeze(1)
 
             # If SE2 (state_dim == 3), rotate into body frame
-            if self.state_dim == 3:
+            if self.state_dim == 3 and pos_dim == 2:
                 theta = geom_state[:, 2]  # [Batch]
                 # Prepare rotation components
                 # theta needs to be broadcasted to [Batch, W]
@@ -486,6 +489,45 @@ class TransformerActor(nn.Module):
                     mpc_state_rel = mpc_state.clone()
                     mpc_state_rel[:, :self.waypoint_dim] -= wp
                     mpc_state = mpc_state_rel
+
+            # For high-dimensional states (e.g. quadrotor with rotation matrix),
+            # build x_ref and u_ref that encode a proper equilibrium so the MPC
+            # cost (x - x_ref)'Q(x - x_ref) has zero error at the desired hover.
+            #
+            # Without this fix:
+            #   x_ref = 0 penalises the identity rotation (R_flat != 0)
+            #   u_ref = 0 penalises hover thrust, causing free-fall
+            if x_ref_tensor is None and self.state_dim > 3:
+                batch = state_batch.size(0)
+                horizon = self.mpc_head.config.horizon
+                dev, dt = state_batch.device, state_batch.dtype
+                # x_ref: zero position error (relative coords), zero velocity,
+                # identity rotation [1,0,0,0,1,0,0,0,1]
+                x_ref_single = torch.zeros(self.state_dim, device=dev, dtype=dt)
+                if self.state_dim >= 15:
+                    x_ref_single[6] = 1.0   # R[0,0]
+                    x_ref_single[10] = 1.0  # R[1,1]
+                    x_ref_single[14] = 1.0  # R[2,2]
+                x_ref_tensor = x_ref_single.view(1, 1, -1).expand(batch, horizon + 1, -1).contiguous()
+
+            if u_ref_tensor is None and self.state_dim > 3:
+                batch = state_batch.size(0)
+                horizon = self.mpc_head.config.horizon
+                dev, dt = state_batch.device, state_batch.dtype
+                mpc_cfg = self.mpc_head.config
+                # Prefer explicit equilibrium reference (e.g. hover thrust = m*g),
+                # otherwise fall back to the midpoint of the action bounds.
+                if getattr(mpc_cfg, "u_ref", None) is not None:
+                    u_ref_single = torch.as_tensor(mpc_cfg.u_ref, device=dev, dtype=dt)
+                    if u_ref_single.numel() == 1:
+                        u_ref_single = u_ref_single.expand(self.action_dim)
+                elif mpc_cfg.u_min is not None and mpc_cfg.u_max is not None:
+                    u_lo = torch.as_tensor(mpc_cfg.u_min, device=dev, dtype=dt)
+                    u_hi = torch.as_tensor(mpc_cfg.u_max, device=dev, dtype=dt)
+                    u_ref_single = 0.5 * (u_lo + u_hi)
+                else:
+                    u_ref_single = torch.zeros(self.action_dim, device=dev, dtype=dt)
+                u_ref_tensor = u_ref_single.view(1, 1, -1).expand(batch, horizon, -1).contiguous()
 
             head_output = self.mpc_head(
                 state=mpc_state if mpc_state.dim() == 2 else mpc_state.unsqueeze(0),

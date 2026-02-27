@@ -1,0 +1,4 @@
+Checkpoint: /home/nat-nus/apg/AC-MPC/checkpoints/quadrotor/checkpoint_step0000001.pt
+Episodes: 20
+Average waypoints: 1.650
+Average reward: 15.933

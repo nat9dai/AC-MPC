@@ -18,6 +18,7 @@ from .logger import LoggerConfig, TrainingLogger
 from .normalization import ObservationNormalizer, RewardNormalizer
 from ..sampling.rollout import RolloutBatch
 
+# from time import time
 
 @dataclass
 class TrainingBatch:
@@ -110,6 +111,9 @@ class TrainingConfig:
     resume_latest: bool = False
     # Alignment auxiliary loss for cost map regularization (double integrator specific)
     alignment_loss_coeff: float = 0.0
+    # Auxiliary loss for penalizing distance from waypoint
+    distance_loss_coeff: float = 0.0
+    distance_loss_threshold: float = 5.0
     normalize_observations: bool = False
     normalize_state: Optional[bool] = None
     normalize_waypoint: Optional[bool] = None
@@ -801,31 +805,38 @@ class TrainingLoop:
             return 0
 
         for epoch in range(self.config.ppo_epochs):
-            permutation = torch.randperm(num_samples, device=self.device)
+            permutation = torch.randperm(num_samples, device=self.device) # shuffle data
             epoch_value_losses: list[float] = []
             pending = {key: 0.0 for key in metric_keys}
             pending_count = 0
 
-            for start in range(0, num_samples, mini_batch_size):
+            for start in range(0, num_samples, mini_batch_size):                
                 idx = permutation[start : start + mini_batch_size]
-                mini_batch = self._slice_batch(stacked, idx)
+                mini_batch = self._slice_batch(stacked, idx) # split shuffled data into mini-batches
                 self._apply_lr_schedule(self._global_updates + 1)
-
+                # start_time = time()
                 self.grad_manager.prepare_microbatch()
                 with self.grad_manager.autocast():
-                    loss, metrics = self._compute_losses(mini_batch)
+                    loss, metrics = self._compute_losses(mini_batch) # compute policy + value losses
 
                 pending_count += 1
                 for key in metric_keys:
                     pending[key] += metrics[key]
 
                 stepped, actor_norm, critic_norm = self.grad_manager.backward(loss)
+                # end_time = time()
+                # grad_time = end_time - start_time
+                # print grad_time
+                # print(f"Epoch {epoch+1}, batch {start//mini_batch_size+1}/{(num_samples-1)//mini_batch_size+1}, grad_time: {grad_time:.3f}s")
+                _ctrl = getattr(getattr(self.agent.actor, "mpc_head", None), "_controller", None)
+                if _ctrl is not None and _ctrl.last_backward_time is not None:
+                    print(f"MPC backward time: {_ctrl.last_backward_time:.4f}s")
                 if stepped:
                     pending_count = flush_pending(pending, pending_count, actor_norm, critic_norm, epoch_value_losses)
 
                 if (
                     self.config.target_kl is not None
-                    and metrics["approx_kl"] > self.config.target_kl
+                    and metrics["approx_kl"] > self.config.target_kl # early stop
                 ):
                     break  # Stop this epoch early if KL for the mini-batch is too large.
 
@@ -1090,10 +1101,17 @@ class TrainingLoop:
         alignment_loss = None
         if self.config.alignment_loss_coeff > 0.0:
             alignment_loss = self._compute_alignment_loss(obs_seq, state, waypoint_seq, warm_start)
-        
+
+        # Auxiliary distance penalty loss
+        distance_loss = None
+        if self.config.distance_loss_coeff > 0.0:
+            distance_loss = self._compute_distance_penalty_loss(raw_state, raw_waypoint_seq)
+
         total_loss = policy_loss + self.config.value_loss_coeff * value_loss
         if alignment_loss is not None:
             total_loss = total_loss + self.config.alignment_loss_coeff * alignment_loss
+        if distance_loss is not None:
+            total_loss = total_loss + self.config.distance_loss_coeff * distance_loss
 
         metrics = {
             "policy_loss": float(policy_loss.detach().cpu()),
@@ -1137,7 +1155,33 @@ class TrainingLoop:
             metrics["mpve_value_loss"] = float(mpve_loss.detach().cpu())
         if alignment_loss is not None:
             metrics["alignment_loss"] = float(alignment_loss.detach().cpu())
+        if distance_loss is not None:
+            metrics["distance_loss"] = float(distance_loss.detach().cpu())
         return total_loss, metrics
+
+    def _compute_distance_penalty_loss(
+        self,
+        raw_state: Optional[Tensor],
+        raw_waypoint_seq: Optional[Tensor],
+    ) -> Tensor:
+        """Computes an auxiliary loss that penalizes states far from the waypoint."""
+        if raw_state is None or raw_waypoint_seq is None or raw_waypoint_seq.numel() == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Assumes state is [x, y, ...] and waypoint is [x, y, ...]
+        # Use unnormalized data for accurate distance calculation.
+        waypoint_dim = raw_waypoint_seq.shape[-1]
+        current_pos = raw_state[:, :waypoint_dim]
+        target_waypoint = raw_waypoint_seq[:, 0, :]  # Use the first waypoint in the sequence
+
+        distance = torch.norm(current_pos - target_waypoint, dim=1)
+
+        # Penalize distance exceeding a threshold using a ReLU-like function.
+        threshold = self.config.distance_loss_threshold
+        penalty = torch.relu(distance - threshold)
+
+        # The loss is the mean penalty over the batch.
+        return penalty.mean()
 
     def _compute_alignment_loss(
         self, 

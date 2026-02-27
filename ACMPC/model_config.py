@@ -34,6 +34,7 @@ class CostMapConfig:
     # linear terms during training to encourage exploration in cost space.
     noise_scale_diag: float = 0.0
     noise_scale_linear: float = 0.0
+    shared_cost: bool = False
 
 
 @dataclass

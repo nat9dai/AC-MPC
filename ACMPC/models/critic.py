@@ -186,10 +186,11 @@ class TransformerCritic(nn.Module):
                         f"raw_waypoint_seq length {geom_waypoint.size(1)} exceeds configured waypoint_sequence_len {self.waypoint_sequence_len}."
                     )
 
-            current_pos = geom_state[:, :2]
+            pos_dim = self.waypoint_dim
+            current_pos = geom_state[:, :pos_dim]
             rel_pos_global = geom_waypoint - current_pos.unsqueeze(1)
 
-            if self.state_dim == 3: # SE2 Heuristic
+            if self.state_dim == 3 and pos_dim == 2:  # SE2 Heuristic
                 theta = geom_state[:, 2]
                 theta = theta.unsqueeze(1).expand(-1, rel_pos_global.size(1))
                 cos_t = torch.cos(theta)

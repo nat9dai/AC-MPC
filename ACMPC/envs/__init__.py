@@ -10,6 +10,14 @@ from .se2_kinematic_waypoint import (
     CircleObstacle,
     build_se2_kinematic_dynamics,
 )
+from .quadrotor_waypoint import (
+    QuadrotorWaypointEnv,
+    build_quadrotor_dynamics,
+)
+from .quadrotor_double_integrator_waypoint import (
+    DoubleIntegrator3DWaypointEnv,
+    build_velocity_dynamics_3d,
+)
 
 __all__ = [
     "DoubleIntegratorWaypointEnvV2",
@@ -18,4 +26,8 @@ __all__ = [
     "SE2WaypointObstacleEnv",
     "CircleObstacle",
     "build_se2_kinematic_dynamics",
+    "QuadrotorWaypointEnv",
+    "build_quadrotor_dynamics",
+    "DoubleIntegrator3DWaypointEnv",
+    "build_velocity_dynamics_3d",
 ]

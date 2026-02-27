@@ -62,8 +62,10 @@ class CostMapNetwork(nn.Module):
             layers.append(nn.Dropout(dropout))
         self.backbone = nn.Sequential(*layers)
 
-        stage_diag_dim = horizon * (state_dim + action_dim)
-        stage_linear_dim = horizon * (state_dim + action_dim)
+        self.shared_cost = getattr(config, "shared_cost", False)
+        stage_steps = 1 if self.shared_cost else horizon
+        stage_diag_dim = stage_steps * (state_dim + action_dim)
+        stage_linear_dim = stage_steps * (state_dim + action_dim)
         terminal_diag_dim = state_dim + action_dim
         terminal_linear_dim = state_dim + action_dim
         output_dim = stage_diag_dim + stage_linear_dim + terminal_diag_dim + terminal_linear_dim
@@ -100,10 +102,12 @@ class CostMapNetwork(nn.Module):
         x = self.backbone(features)
         raw = self.head(x)
 
-        stage_diag_dim = self.horizon * (self.state_dim + self.action_dim)
+        stage_steps = 1 if self.shared_cost else self.horizon
+        nxu = self.state_dim + self.action_dim
+        stage_diag_dim = stage_steps * nxu
         stage_linear_dim = stage_diag_dim
-        terminal_diag_dim = self.state_dim + self.action_dim
-        terminal_linear_dim = terminal_diag_dim
+        terminal_diag_dim = nxu
+        terminal_linear_dim = nxu
 
         cursor = 0
         stage_diag_raw = raw[:, cursor : cursor + stage_diag_dim]
@@ -118,7 +122,9 @@ class CostMapNetwork(nn.Module):
         eps = 1e-6
 
         # Running diagonals
-        stage_diag = stage_diag_raw.view(-1, self.horizon, self.state_dim + self.action_dim)
+        stage_diag = stage_diag_raw.view(-1, stage_steps, nxu)
+        if self.shared_cost:
+            stage_diag = stage_diag.expand(-1, self.horizon, -1)
         stage_q_raw = stage_diag[..., : self.state_dim]
         stage_r_raw = stage_diag[..., self.state_dim :]
         stage_q = cfg.q_min + (cfg.q_max - cfg.q_min) * self.sigmoid(stage_q_raw)
@@ -134,7 +140,9 @@ class CostMapNetwork(nn.Module):
 
         # Running linear terms (state/action separated bounds)
         # FIX: Use sigmoid to guarantee c > 0 (attracts to tau=0 waypoint)
-        stage_linear = stage_linear_raw.view(-1, self.horizon, self.state_dim + self.action_dim)
+        stage_linear = stage_linear_raw.view(-1, stage_steps, nxu)
+        if self.shared_cost:
+            stage_linear = stage_linear.expand(-1, self.horizon, -1)
         stage_linear_state = 0.1 + cfg.linear_state_bound * self.sigmoid(stage_linear[..., : self.state_dim])
         stage_linear_action = 0.1 + cfg.linear_action_bound * self.sigmoid(stage_linear[..., self.state_dim :])
         if self.training and getattr(self.config, "noise_scale_linear", 0.0) > 0.0:

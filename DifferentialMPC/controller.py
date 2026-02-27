@@ -67,9 +67,13 @@ class ILQRSolve(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_X_out: Tensor, grad_U_out: Tensor):
+        import time as _time
+        ctrl = ctx.controller
+        _t0 = _time.perf_counter() if ctrl.time_backward else None 
+        # time.perf_counter() computes relative time, whereas time.time() computesabsolute
+
         # 1. Recover saved data
         X, U, H_xx, H_uu, H_xu, A, Bm, tight_mask, x_ref, u_ref = ctx.saved_tensors
-        ctrl = ctx.controller
         B, T, nx, nu = X.shape[0], U.shape[1], ctrl.nx, ctrl.nu
 
         # 2. Solve LQR backward to get sensitivities (dX/dθ, dU/dθ)
@@ -135,6 +139,9 @@ class ILQRSolve(torch.autograd.Function):
         grad_xref[:, -1, :] = derr_xN
         grad_uref = derr_u
 
+        if _t0 is not None:
+            ctrl.last_backward_time = _time.perf_counter() - _t0
+
         # 5. Restituisci i gradienti nell'ordine corretto degli input di forward()
         return (
             grad_x0,
@@ -189,7 +196,8 @@ class DifferentiableMPCController(torch.nn.Module):
             verbose: int = 0,
             use_armijo_line_search: bool = False,
             armijo_c1: float = 1e-4,
-            armijo_c2: float = 0.9
+            armijo_c2: float = 0.9,
+            time_backward: bool = True,
     ):
         super().__init__()
         # Dispositivo
@@ -256,6 +264,10 @@ class DifferentiableMPCController(torch.nn.Module):
         self.use_armijo_line_search = use_armijo_line_search
         self.armijo_c1 = armijo_c1
         self.armijo_c2 = armijo_c2
+
+        # Backward timing
+        self.time_backward = time_backward
+        self.last_backward_time: Optional[float] = None
 
     #   Calcolo Jacobiane A, B
     def _jacobian_analytic(self, x: torch.Tensor, u: torch.Tensor):
@@ -325,6 +337,11 @@ class DifferentiableMPCController(torch.nn.Module):
         U, X = U_init.clone(), self.rollout_trajectory(x0, U_init)
 
         x_ref_batch, u_ref_batch = self.cost_module.x_ref, self.cost_module.u_ref
+        # Expand references to match batch size for vmap compatibility
+        if x_ref_batch.shape[0] == 1 and B > 1:
+            x_ref_batch = x_ref_batch.expand(B, -1, -1)
+        if u_ref_batch.shape[0] == 1 and B > 1:
+            u_ref_batch = u_ref_batch.expand(B, -1, -1)
         best_cost = self.cost_module.objective(X, U, x_ref_override=x_ref_batch, u_ref_override=u_ref_batch)
 
         # FIX: Proper convergence tracking
@@ -430,10 +447,6 @@ class DifferentiableMPCController(torch.nn.Module):
         A, Bm = self.linearize_dynamics(X, U)
         self.H_last, self.F_last = (l_xx, l_uu, l_xu), (A, Bm)
         self.tight_mask_last, self.X_last, self.U_last = self._compute_tight_mask(U), X, U
-
-        # FIX: Memory leak cleanup after solve_step completion
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Clear GPU memory after intensive computation
 
         return X, U
 
@@ -671,7 +684,8 @@ class DifferentiableMPCController(torch.nn.Module):
             if ("singular" in error_str or
                     "not positive definite" in error_str or
                     "not positive-definite" in error_str or
-                    "factorization could not be completed" in error_str):
+                    "factorization could not be completed" in error_str or
+                    "lazy wrapper" in error_str):
                 # Secondary: SVD decomposition for robustness
                 try:
                     U, S, Vh = torch.linalg.svd(Q_uu)
@@ -988,7 +1002,8 @@ class DifferentiableMPCController(torch.nn.Module):
                     H_f.unsqueeze(0),
                     q_f.unsqueeze(0),
                     lb_f.unsqueeze(0),
-                    ub_f.unsqueeze(0)
+                    ub_f.unsqueeze(0),
+                    reg=self.reg_eps,
                 )
                 du_f = du_batch.squeeze(0)
                 # Ensure dtype consistency with V for mixed precision
@@ -1045,14 +1060,65 @@ class DifferentiableMPCController(torch.nn.Module):
         batch_size, T, nx, _ = A.shape
         device = A.device
         dtype = A.dtype
+        nu = self.nu
 
-        eye_nu = (torch.eye(self.nu, device=device, dtype=dtype) * self.reg_eps).unsqueeze(0).expand(batch_size, -1, -1)
+        # ── Fast path: scan over T, vmap over B ────────────────────────
+        if _HAS_SCAN:
+            I_nu = torch.eye(nu, device=device, dtype=dtype) * (self.reg_eps * (1.0 + 1e-8))
+
+            def _single(A_i, B_i, H_xx_i, H_uu_i, H_xu_i, gx_i, gu_i):
+                # Backward Riccati sweep
+                def riccati_step(carry, inps):
+                    V, v = carry
+                    A_t, B_t, H_xx_t, H_uu_t, H_xu_t, gx_t, gu_t = inps
+                    V_B = V @ B_t
+                    Q_xx = H_xx_t + A_t.T @ V @ A_t
+                    Q_xu = H_xu_t + A_t.T @ V_B
+                    Q_ux = Q_xu.T
+                    Q_uu = H_uu_t + B_t.T @ V_B + I_nu
+                    q_x = gx_t + A_t.T @ v
+                    q_u = gu_t + B_t.T @ v
+                    K_t = -torch.linalg.solve(Q_uu, Q_ux)
+                    k_t = -torch.linalg.solve(Q_uu, q_u)
+                    V_new = Q_xx + K_t.T @ Q_uu @ K_t + K_t.T @ Q_ux + Q_xu @ K_t
+                    v_new = q_x + K_t.T @ (Q_uu @ k_t + q_u) + Q_xu @ k_t
+                    return (V_new, v_new), (K_t, k_t)
+
+                _, (K_rev, k_rev) = scan(
+                    riccati_step,
+                    (H_xx_i[-1], gx_i[-1]),
+                    (torch.flip(A_i, [0]), torch.flip(B_i, [0]),
+                     torch.flip(H_xx_i, [0]), torch.flip(H_uu_i, [0]),
+                     torch.flip(H_xu_i, [0]), torch.flip(gx_i, [0]),
+                     torch.flip(gu_i, [0]))
+                )
+                K_seq = torch.flip(K_rev, [0])  # [T, nu, nx]
+                k_seq = torch.flip(k_rev, [0])  # [T, nu]
+
+                # Forward sensitivity sweep
+                def forward_step(dx, inps):
+                    K_t, k_t, A_t, B_t = inps
+                    du = K_t @ dx + k_t
+                    return A_t @ dx + B_t @ du, (dx, du)
+
+                dx_T, (dx_seq, du_seq) = scan(
+                    forward_step,
+                    torch.zeros(nx, device=device, dtype=dtype),
+                    (K_seq, k_seq, A_i, B_i)
+                )
+                dX = torch.cat([dx_seq, dx_T.unsqueeze(0)], dim=0)  # [T+1, nx]
+                return dX, du_seq  # [T, nu]
+
+            return _vmap(_single)(A, B, H_xx, H_uu, H_xu, grad_x, grad_u)
+
+        # ── Fallback: Python loops ──────────────────────────────────────
+        eye_nu = (torch.eye(nu, device=device, dtype=dtype) * self.reg_eps).unsqueeze(0).expand(batch_size, -1, -1)
 
         V = H_xx[:, -1]
         v = grad_x[:, -1]
 
-        K_seq = []
-        k_seq = []
+        K_seq = torch.empty(batch_size, T, nu, nx, device=device, dtype=dtype)
+        k_seq = torch.empty(batch_size, T, nu, device=device, dtype=dtype)
 
         for t in range(T - 1, -1, -1):
             A_t = A[:, t].to(dtype=V.dtype)
@@ -1080,8 +1146,8 @@ class DifferentiableMPCController(torch.nn.Module):
             K_t = -torch.linalg.solve(Q_uu_reg, Q_ux)
             k_t = -torch.linalg.solve(Q_uu_reg, q_u.unsqueeze(-1)).squeeze(-1)
 
-            K_seq.append(K_t)
-            k_seq.append(k_t)
+            K_seq[:, t] = K_t
+            k_seq[:, t] = k_t
 
             Q_uu_k = torch.matmul(Q_uu, k_t.unsqueeze(-1)).squeeze(-1)
             V = Q_xx + torch.matmul(K_t.transpose(-1, -2), torch.matmul(Q_uu, K_t)) \
@@ -1090,12 +1156,9 @@ class DifferentiableMPCController(torch.nn.Module):
             v = q_x + torch.matmul(K_t.transpose(-1, -2), (Q_uu_k + q_u).unsqueeze(-1)).squeeze(-1) \
                 + torch.matmul(Q_xu, k_t.unsqueeze(-1)).squeeze(-1)
 
-        K_seq = torch.stack(K_seq[::-1], dim=1)  # [B, T, nu, nx]
-        k_seq = torch.stack(k_seq[::-1], dim=1)  # [B, T, nu]
-
         # Forward sweep for state-action perturbations
         dX = torch.zeros(batch_size, T + 1, nx, device=device, dtype=dtype)
-        dU = torch.zeros(batch_size, T, self.nu, device=device, dtype=dtype)
+        dU = torch.zeros(batch_size, T, nu, device=device, dtype=dtype)
 
         for t in range(T):
             dx = dX[:, t]
@@ -1138,7 +1201,3 @@ class DifferentiableMPCController(torch.nn.Module):
         self.tight_mask_last = None
         self.converged = None
 
-        # FIX: Aggressive memory cleanup for training stability
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()  # Ensure cleanup completion

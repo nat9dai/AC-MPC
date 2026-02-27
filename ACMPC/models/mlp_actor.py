@@ -171,8 +171,22 @@ class MLPActor(nn.Module):
         # Extract current state (last timestep)
         current_state = history[:, -1, :]  # [batch, state_dim]
 
-        # Build MLP input by concatenating features
-        mlp_inputs = [current_state]
+        # Build MLP input with waypoint-relative position so the cost-map backbone
+        # operates in the same reference frame as the MPC (which receives
+        # state[:pos_dim] - waypoint).  Without this, the backbone sees absolute
+        # drone coordinates while the MPC state is waypoint-relative, making it
+        # impossible to learn a position-invariant cost.
+        if mpc_waypoint is not None and self.waypoint_dim > 0:
+            wp_cur = mpc_waypoint[:, 0, :] if mpc_waypoint.dim() == 3 else mpc_waypoint
+            if wp_cur.dim() == 3:
+                wp_cur = wp_cur.squeeze(1)
+            current_state_mlp = current_state.clone()
+            current_state_mlp[:, :self.waypoint_dim] = (
+                current_state[:, :self.waypoint_dim] - wp_cur
+            )
+            mlp_inputs: list = [current_state_mlp]
+        else:
+            mlp_inputs = [current_state]
 
         if self.include_prev_action:
             if prev_actions is None:
@@ -195,13 +209,21 @@ class MLPActor(nn.Module):
             mlp_inputs.append(lidar)
 
         if self.waypoint_dim > 0 and self.waypoint_sequence_len > 0:
-            waypoint_input = waypoint_seq if waypoint_seq is not None else raw_waypoint_seq
-            if waypoint_input is not None:
-                if waypoint_input.dim() == 2:
-                    waypoint_input = waypoint_input.unsqueeze(1)
-                if waypoint_input.dim() == 3:
-                    # Flatten waypoint sequence
-                    waypoint_flat = waypoint_input.view(batch, -1)  # [batch, waypoint_dim * waypoint_sequence_len]
+            geom_wp = raw_waypoint_seq if raw_waypoint_seq is not None else waypoint_seq
+            if geom_wp is not None:
+                if geom_wp.dim() == 2:
+                    geom_wp = geom_wp.unsqueeze(1)
+                if geom_wp.dim() == 3:
+                    # Feed the relative vector (waypoint - drone_pos) instead of absolute
+                    # waypoint coordinates.  This mirrors what TransformerActor does and
+                    # makes the backbone position-invariant, which is required for the
+                    # cost map to generalise across the workspace.
+                    geom_state_src = raw_state if raw_state is not None else state
+                    if geom_state_src.dim() == 1:
+                        geom_state_src = geom_state_src.unsqueeze(0)
+                    current_pos = geom_state_src[:, :self.waypoint_dim]  # [B, pos_dim]
+                    rel_wp = geom_wp - current_pos.unsqueeze(1)          # [B, W, pos_dim]
+                    waypoint_flat = rel_wp.view(batch, -1)
                     mlp_inputs.append(waypoint_flat)
 
         mlp_input = torch.cat(mlp_inputs, dim=-1)  # [batch, mlp_input_dim]
@@ -287,6 +309,45 @@ class MLPActor(nn.Module):
                     mpc_state_rel = mpc_state.clone()
                     mpc_state_rel[:, :self.waypoint_dim] -= wp
                     mpc_state = mpc_state_rel
+
+            # For high-dimensional states (e.g. quadrotor with rotation matrix),
+            # build x_ref and u_ref that encode a proper equilibrium so the MPC
+            # cost (x - x_ref)'Q(x - x_ref) has zero error at the desired hover.
+            #
+            # Without this fix:
+            #   x_ref = 0 penalises the identity rotation (R_flat != 0)
+            #   u_ref = 0 penalises hover thrust, causing free-fall
+            if x_ref_tensor is None and self.state_dim > 3:
+                batch_sz = state_batch.size(0)
+                horizon = self.mpc_head.config.horizon
+                dev, dt = state_batch.device, state_batch.dtype
+                # x_ref: zero position error (relative coords), zero velocity,
+                # identity rotation [1,0,0,0,1,0,0,0,1]
+                x_ref_single = torch.zeros(self.state_dim, device=dev, dtype=dt)
+                if self.state_dim >= 15:
+                    x_ref_single[6] = 1.0   # R[0,0]
+                    x_ref_single[10] = 1.0  # R[1,1]
+                    x_ref_single[14] = 1.0  # R[2,2]
+                x_ref_tensor = x_ref_single.view(1, 1, -1).expand(batch_sz, horizon + 1, -1).contiguous()
+
+            if u_ref_tensor is None and self.state_dim > 3:
+                batch_sz = state_batch.size(0)
+                horizon = self.mpc_head.config.horizon
+                dev, dt = state_batch.device, state_batch.dtype
+                mpc_cfg = self.mpc_head.config
+                # Prefer explicit equilibrium reference (e.g. hover thrust = m*g),
+                # otherwise fall back to the midpoint of the action bounds.
+                if getattr(mpc_cfg, "u_ref", None) is not None:
+                    u_ref_single = torch.as_tensor(mpc_cfg.u_ref, device=dev, dtype=dt)
+                    if u_ref_single.numel() == 1:
+                        u_ref_single = u_ref_single.expand(self.action_dim)
+                elif mpc_cfg.u_min is not None and mpc_cfg.u_max is not None:
+                    u_lo = torch.as_tensor(mpc_cfg.u_min, device=dev, dtype=dt)
+                    u_hi = torch.as_tensor(mpc_cfg.u_max, device=dev, dtype=dt)
+                    u_ref_single = 0.5 * (u_lo + u_hi)
+                else:
+                    u_ref_single = torch.zeros(self.action_dim, device=dev, dtype=dt)
+                u_ref_tensor = u_ref_single.view(1, 1, -1).expand(batch_sz, horizon, -1).contiguous()
 
             head_output = self.mpc_head(
                 state=mpc_state if mpc_state.dim() == 2 else mpc_state.unsqueeze(0),

@@ -1,0 +1,6 @@
+Checkpoint: /home/nat-nus/apg/AC-MPC/checkpoints/double_integrator/checkpoint_step0001138.pt
+Episodes: 20
+Average waypoints: 82.700
+Average reward: 885.458
+Final Q diag (mean): [494.38666 496.6337   76.58375 440.49194]
+Final R diag (mean): [28.787008 26.82846 ]

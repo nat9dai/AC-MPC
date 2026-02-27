@@ -61,6 +61,7 @@ class EconomicMPCConfig:
     terminal_state_cost: Union[float, Sequence[float], Tensor] = 5.0
     u_min: Optional[Sequence[float] | float | Tensor] = None
     u_max: Optional[Sequence[float] | float | Tensor] = None
+    u_ref: Optional[Sequence[float] | float | Tensor] = None  # hover/equilibrium control reference
     require_analytic_jacobian: bool = False
     enable_autodiff_fallback: bool = True
     jacobian_cache_size: int = 1024

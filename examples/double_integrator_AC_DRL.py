@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="CLI override tokens (section.field=value). Can be provided multiple times.",
     )
-    parser.add_argument("--device", type=str, default="auto", help="cpu/cuda/auto (default: auto).")
+    parser.add_argument("--device", type=str, default="cuda", help="cpu/cuda/auto (default: auto).")
     parser.add_argument("--seed", type=int, default=7, help="Random seed used for envs and torch.")
     parser.add_argument("--total-iters", type=int, default=50, help="Number of PPO update cycles.")
     parser.add_argument(
@@ -119,6 +119,18 @@ def parse_args() -> argparse.Namespace:
         help="Positive reward per unit control magnitude (used only when action-penalty == 0).",
     )
     parser.add_argument("--goal-bonus", type=float, default=10.0, help="Reward added when a waypoint is reached.")
+    parser.add_argument(
+        "--max-distance-threshold",
+        type=float,
+        default=None,
+        help="Terminate episode if distance to waypoint exceeds this threshold (if set).",
+    )
+    parser.add_argument(
+        "--max-distance-penalty",
+        type=float,
+        default=20.0,
+        help="Penalty applied when max_distance_threshold is exceeded.",
+    )
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -195,7 +207,7 @@ def resolve_device(requested: Optional[str], config_default: str) -> str:
 
 
 def build_env_kwargs(args: argparse.Namespace, *, episode_len: int) -> Dict[str, float | int]:
-    return {
+    kwargs = {
         "dt": float(args.dt),
         "episode_len": int(episode_len),
         "waypoint_range": float(args.waypoint_range),
@@ -209,6 +221,10 @@ def build_env_kwargs(args: argparse.Namespace, *, episode_len: int) -> Dict[str,
         "goal_bonus": float(args.goal_bonus),
         "control_gain": float(args.control_gain),
     }
+    if args.max_distance_threshold is not None:
+        kwargs["max_distance_threshold"] = float(args.max_distance_threshold)
+        kwargs["max_distance_penalty"] = float(args.max_distance_penalty)
+    return kwargs
 
 
 def apply_cli_overrides(
@@ -609,6 +625,12 @@ def main() -> None:
     overrides = args.override if args.override else None
     config = load_experiment_config(args.config, overrides=overrides)
 
+    # Switch to MLP actor/critic from Transformer backbone
+    config.model.actor.backbone_type = "mlp"
+    # The critic backbone will be synced automatically by AgentConfig,
+    # but we can also set it explicitly for clarity.
+    config.model.critic.backbone_type = "mlp"
+
     episode_len = args.episode_len if args.episode_len is not None else config.sampler.episode_len
     env_kwargs = build_env_kwargs(args, episode_len=episode_len)
 
@@ -746,6 +768,7 @@ def main() -> None:
                     collector.collect(horizon=config.sampler.rollout_steps)
                     for _ in range(args.rollouts_per_iter)
                 ]
+                print("Run loop.run() with collected batches...")
                 metrics = loop.run(batches)
                 avg_waypoints = compute_mean_waypoints(batches)
                 avg_reward = compute_mean_episode_reward(batches)

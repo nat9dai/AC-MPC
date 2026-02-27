@@ -1,0 +1,97 @@
+seed: 7
+device: cpu
+
+model:
+  history_window: 16
+  segment_len: 16
+  mem_len: 32
+  max_history_tokens: 64
+  kv_cache_max_tokens: 64
+  waypoint_sequence_len: 1
+  waypoint_dim: 3
+  include_prev_action: false
+  actor:
+    input_dim: 6
+    backbone_type: mlp
+    include_prev_action: false
+    waypoint_dim: 3
+    waypoint_sequence_len: 1
+    mlp:
+      hidden_dim: 512
+      output_dim: 512
+      num_layers: 2
+      activation: relu
+      dropout: 0.0
+    mpc:
+      horizon: 20
+      state_dim: 6
+      action_dim: 3
+      dt: 0.1
+      latent_dim: 512
+      device: cpu
+      max_iter: 15
+      tol_x: 1.0e-3
+      tol_u: 1.0e-3
+      reg_eps: 1.0e-3
+      u_min: [-3.0, -3.0, -3.0]
+      u_max: [3.0, 3.0, 3.0]
+      require_analytic_jacobian: true
+      enable_autodiff_fallback: false
+      jacobian_cache_size: 256
+      jacobian_cache_max_age: 128
+      warm_start_cache_max_size: 32
+      warm_start_drift_tol: 1.0e-3
+    cost_map:
+      hidden_dim: 512
+      num_layers: 2
+      dropout: 0.0
+      noise_scale_diag: 0.1
+      noise_scale_linear: 0.1
+      shared_cost: true
+      bounds:
+        q_min: 0.1
+        q_max: 100000.0
+        r_min: 0.1
+        r_max: 10.0
+        linear_state_bound: 10.0
+        linear_action_bound: 5.0
+  critic:
+    input_dim: 6
+    backbone_type: mlp
+    include_prev_action: false
+    waypoint_dim: 3
+    waypoint_sequence_len: 1
+    mlp:
+      hidden_dim: 512
+      output_dim: 512
+      num_layers: 2
+      activation: relu
+      dropout: 0.0
+    value_head_hidden: 512
+
+sampler:
+  num_envs: 32
+  rollout_steps: 24
+  episode_len: 24
+
+training:
+  device: cpu
+  actor_lr: 1.0e-4
+  critic_lr: 5.0e-5
+  mini_batch_size: 500
+  ppo_epochs: 4
+  clip_param: 0.12
+  entropy_coeff: 0.04
+  gamma: 0.98
+  gae_lambda: 0.90
+  target_kl: 0.02
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: false
+  normalize_returns: true
+  return_clip_value: 10.0
+  log_interval: 10
+  log_to_stdout: true
+  checkpoint_interval: 1
+  checkpoint_metric: episode_reward
+  checkpoint_mode: max
